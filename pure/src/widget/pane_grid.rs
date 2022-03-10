@@ -7,39 +7,33 @@
 //! drag and drop, and hotkey support.
 //!
 //! [`pane_grid` example]: https://github.com/iced-rs/iced/tree/0.3/examples/pane_grid
-mod axis;
-mod configuration;
 mod content;
-mod direction;
-mod node;
-mod pane;
-mod split;
 mod title_bar;
 
-pub mod state;
-
-pub use axis::Axis;
-pub use configuration::Configuration;
 pub use content::Content;
-pub use direction::Direction;
-pub use node::Node;
-pub use pane::Pane;
-pub use split::Split;
-pub use state::State;
 pub use title_bar::TitleBar;
 
-use crate::event::{self, Event};
-use crate::layout;
-use crate::mouse;
+pub use iced_native::widget::pane_grid::{
+    Axis, Configuration, Direction, DragEvent, Node, Pane, ResizeEvent, Split,
+};
+
 use crate::overlay;
-use crate::renderer;
-use crate::touch;
-use crate::{
-    Clipboard, Color, Element, Layout, Length, Point, Rectangle, Shell, Size,
-    Vector, Widget,
+use crate::widget::tree::{self, Tree};
+use crate::{Element, Widget};
+
+use iced_native::event::{self, Event};
+use iced_native::layout;
+use iced_native::mouse;
+use iced_native::renderer;
+use iced_native::touch;
+use iced_native::widget::pane_grid::state;
+use iced_native::{
+    Clipboard, Color, Layout, Length, Point, Rectangle, Shell, Size, Vector,
 };
 
 pub use iced_style::pane_grid::{Line, StyleSheet};
+
+use std::collections::HashMap;
 
 /// A collection of panes distributed using either vertical or horizontal splits
 /// to completely fill the space available.
@@ -63,10 +57,10 @@ pub use iced_style::pane_grid::{Line, StyleSheet};
 /// ## Example
 ///
 /// ```
-/// # use iced_native::widget::{pane_grid, Text};
+/// # use iced_pure::widget::{pane_grid, text};
 /// #
 /// # type PaneGrid<'a, Message> =
-/// #     iced_native::widget::PaneGrid<'a, Message, iced_native::renderer::Null>;
+/// #     iced_pure::widget::PaneGrid<'a, Message, iced_native::renderer::Null>;
 /// #
 /// enum PaneState {
 ///     SomePane,
@@ -81,10 +75,10 @@ pub use iced_style::pane_grid::{Line, StyleSheet};
 /// let (mut state, _) = pane_grid::State::new(PaneState::SomePane);
 ///
 /// let pane_grid =
-///     PaneGrid::new(&mut state, |pane, state| {
+///     PaneGrid::new(&state, |pane, state| {
 ///         pane_grid::Content::new(match state {
-///             PaneState::SomePane => Text::new("This is some pane"),
-///             PaneState::AnotherKindOfPane => Text::new("This is another kind of pane"),
+///             PaneState::SomePane => text("This is some pane"),
+///             PaneState::AnotherKindOfPane => text("This is another kind of pane"),
 ///         })
 ///     })
 ///     .on_drag(Message::PaneDragged)
@@ -92,8 +86,7 @@ pub use iced_style::pane_grid::{Line, StyleSheet};
 /// ```
 #[allow(missing_debug_implementations)]
 pub struct PaneGrid<'a, Message, Renderer> {
-    state: &'a mut state::Internal,
-    action: &'a mut state::Action,
+    state: &'a state::Internal,
     elements: Vec<(Pane, Content<'a, Message, Renderer>)>,
     width: Length,
     height: Length,
@@ -104,30 +97,35 @@ pub struct PaneGrid<'a, Message, Renderer> {
     style_sheet: Box<dyn StyleSheet + 'a>,
 }
 
+#[derive(Debug)]
+pub struct State<T> {
+    panes: HashMap<Pane, T>,
+    internal: state::Internal,
+}
+
 impl<'a, Message, Renderer> PaneGrid<'a, Message, Renderer>
 where
-    Renderer: crate::Renderer,
+    Renderer: iced_native::Renderer,
 {
     /// Creates a [`PaneGrid`] with the given [`State`] and view function.
     ///
     /// The view function will be called to display each [`Pane`] present in the
     /// [`State`].
     pub fn new<T>(
-        state: &'a mut State<T>,
-        view: impl Fn(Pane, &'a mut T) -> Content<'a, Message, Renderer>,
+        state: &'a State<T>,
+        view: impl Fn(Pane, &'a T) -> Content<'a, Message, Renderer>,
     ) -> Self {
         let elements = {
             state
                 .panes
-                .iter_mut()
+                .iter()
                 .map(|(pane, pane_state)| (*pane, view(*pane, pane_state)))
                 .collect()
         };
 
         Self {
-            state: &mut state.internal,
-            action: &mut state.action,
             elements,
+            state: state.internal,
             width: Length::Fill,
             height: Length::Fill,
             spacing: 0,
@@ -200,224 +198,10 @@ where
     }
 }
 
-impl<'a, Message, Renderer> PaneGrid<'a, Message, Renderer>
-where
-    Renderer: crate::Renderer,
-{
-    fn click_pane(
-        &mut self,
-        layout: Layout<'_>,
-        cursor_position: Point,
-        shell: &mut Shell<'_, Message>,
-    ) {
-        let mut clicked_region =
-            self.elements.iter().zip(layout.children()).filter(
-                |(_, layout)| layout.bounds().contains(cursor_position),
-            );
-
-        if let Some(((pane, content), layout)) = clicked_region.next() {
-            if let Some(on_click) = &self.on_click {
-                shell.publish(on_click(*pane));
-            }
-
-            if let Some(on_drag) = &self.on_drag {
-                if content.can_be_picked_at(layout, cursor_position) {
-                    let pane_position = layout.position();
-
-                    let origin = cursor_position
-                        - Vector::new(pane_position.x, pane_position.y);
-
-                    *self.action = state::Action::Dragging {
-                        pane: *pane,
-                        origin,
-                    };
-
-                    shell.publish(on_drag(DragEvent::Picked { pane: *pane }));
-                }
-            }
-        }
-    }
-
-    fn trigger_resize(
-        &mut self,
-        layout: Layout<'_>,
-        cursor_position: Point,
-        shell: &mut Shell<'_, Message>,
-    ) -> event::Status {
-        if let Some((_, on_resize)) = &self.on_resize {
-            if let Some((split, _)) = self.action.picked_split() {
-                let bounds = layout.bounds();
-
-                let splits = self.state.split_regions(
-                    f32::from(self.spacing),
-                    Size::new(bounds.width, bounds.height),
-                );
-
-                if let Some((axis, rectangle, _)) = splits.get(&split) {
-                    let ratio = match axis {
-                        Axis::Horizontal => {
-                            let position =
-                                cursor_position.y - bounds.y - rectangle.y;
-
-                            (position / rectangle.height).max(0.1).min(0.9)
-                        }
-                        Axis::Vertical => {
-                            let position =
-                                cursor_position.x - bounds.x - rectangle.x;
-
-                            (position / rectangle.width).max(0.1).min(0.9)
-                        }
-                    };
-
-                    shell.publish(on_resize(ResizeEvent { split, ratio }));
-
-                    return event::Status::Captured;
-                }
-            }
-        }
-
-        event::Status::Ignored
-    }
-}
-
-pub fn update<'a, Message>(
-    action: &mut state::Action,
-    state: &state::Internal,
-    event: &Event,
-    layout: Layout<'_>,
-    cursor_position: Point,
-    shell: &mut Shell<'_, Message>,
-    spacing: u16,
-    panes: impl Iterator<Item = Pane>,
-    on_click: &Option<Box<dyn Fn(Pane) -> Message + 'a>>,
-    on_drag: &Option<Box<dyn Fn(DragEvent) -> Message + 'a>>,
-    on_resize: &Option<(u16, Box<dyn Fn(ResizeEvent) -> Message + 'a>)>,
-) -> event::Status {
-    let mut event_status = event::Status::Ignored;
-
-    match event {
-        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-        | Event::Touch(touch::Event::FingerPressed { .. }) => {
-            let bounds = layout.bounds();
-
-            if bounds.contains(cursor_position) {
-                event_status = event::Status::Captured;
-
-                match on_resize {
-                    Some((leeway, _)) => {
-                        let relative_cursor = Point::new(
-                            cursor_position.x - bounds.x,
-                            cursor_position.y - bounds.y,
-                        );
-
-                        let splits = state.split_regions(
-                            f32::from(spacing),
-                            Size::new(bounds.width, bounds.height),
-                        );
-
-                        let clicked_split = hovered_split(
-                            splits.iter(),
-                            f32::from(spacing + leeway),
-                            relative_cursor,
-                        );
-
-                        if let Some((split, axis, _)) = clicked_split {
-                            if action.picked_pane().is_none() {
-                                *action =
-                                    state::Action::Resizing { split, axis };
-                            }
-                        } else {
-                            click_pane(layout, cursor_position, shell);
-                        }
-                    }
-                    None => {
-                        click_pane(layout, cursor_position, shell);
-                    }
-                }
-            }
-        }
-        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-        | Event::Touch(touch::Event::FingerLifted { .. })
-        | Event::Touch(touch::Event::FingerLost { .. }) => {
-            if let Some((pane, _)) = action.picked_pane() {
-                if let Some(on_drag) = on_drag {
-                    let mut dropped_region =
-                        panes.zip(layout.children()).filter(|(_, layout)| {
-                            layout.bounds().contains(cursor_position)
-                        });
-
-                    let event = match dropped_region.next() {
-                        Some((target, _)) if pane != target => {
-                            DragEvent::Dropped { pane, target }
-                        }
-                        _ => DragEvent::Canceled { pane },
-                    };
-
-                    shell.publish(on_drag(event));
-                }
-
-                *action = state::Action::Idle;
-
-                event_status = event::Status::Captured;
-            } else if action.picked_split().is_some() {
-                *action = state::Action::Idle;
-
-                event_status = event::Status::Captured;
-            }
-        }
-        Event::Mouse(mouse::Event::CursorMoved { .. })
-        | Event::Touch(touch::Event::FingerMoved { .. }) => {
-            event_status = trigger_resize(layout, cursor_position, shell);
-        }
-        _ => {}
-    }
-
-    event_status
-}
-
-/// An event produced during a drag and drop interaction of a [`PaneGrid`].
-#[derive(Debug, Clone, Copy)]
-pub enum DragEvent {
-    /// A [`Pane`] was picked for dragging.
-    Picked {
-        /// The picked [`Pane`].
-        pane: Pane,
-    },
-
-    /// A [`Pane`] was dropped on top of another [`Pane`].
-    Dropped {
-        /// The picked [`Pane`].
-        pane: Pane,
-
-        /// The [`Pane`] where the picked one was dropped on.
-        target: Pane,
-    },
-
-    /// A [`Pane`] was picked and then dropped outside of other [`Pane`]
-    /// boundaries.
-    Canceled {
-        /// The picked [`Pane`].
-        pane: Pane,
-    },
-}
-
-/// An event produced during a resize interaction of a [`PaneGrid`].
-#[derive(Debug, Clone, Copy)]
-pub struct ResizeEvent {
-    /// The [`Split`] that is being dragged for resizing.
-    pub split: Split,
-
-    /// The new ratio of the [`Split`].
-    ///
-    /// The ratio is a value in [0, 1], representing the exact position of a
-    /// [`Split`] between two panes.
-    pub ratio: f32,
-}
-
 impl<'a, Message, Renderer> Widget<Message, Renderer>
     for PaneGrid<'a, Message, Renderer>
 where
-    Renderer: crate::Renderer,
+    Renderer: iced_native::Renderer,
 {
     fn width(&self) -> Length {
         self.width
@@ -458,6 +242,7 @@ where
 
     fn on_event(
         &mut self,
+        tree: &mut Tree,
         event: Event,
         layout: Layout<'_>,
         cursor_position: Point,
@@ -465,29 +250,28 @@ where
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) -> event::Status {
-        let event_status = update(
-            self.action,
-            self.state,
-            &event,
+        let action = tree.state.downcast_mut::<state::Action>();
+        let mut event_status = pane_grid::update(
+            action,
+            event,
             layout,
             cursor_position,
+            renderer,
+            clipboard,
             shell,
-            self.spacing,
-            self.elements.iter().map(|(pane, _)| *pane),
-            &self.on_click,
-            &self.on_drag,
-            &self.on_resize,
         );
 
-        let picked_pane = self.action.picked_pane().map(|(pane, _)| pane);
+        let picked_pane = action.picked_pane().map(|(pane, _)| pane);
 
         self.elements
             .iter_mut()
+            .zip(&mut tree.children)
             .zip(layout.children())
-            .map(|((pane, content), layout)| {
+            .map(|(((pane, content), tree), layout)| {
                 let is_picked = picked_pane == Some(*pane);
 
                 content.on_event(
+                    tree,
                     event.clone(),
                     layout,
                     cursor_position,
@@ -502,20 +286,18 @@ where
 
     fn mouse_interaction(
         &self,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor_position: Point,
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        if self.action.picked_pane().is_some() {
+        if self.state.picked_pane().is_some() {
             return mouse::Interaction::Grab;
         }
 
-        let resize_axis = self
-            .action
-            .picked_split()
-            .map(|(_, axis)| axis)
-            .or_else(|| {
+        let resize_axis =
+            self.state.picked_split().map(|(_, axis)| axis).or_else(|| {
                 self.on_resize.as_ref().and_then(|(leeway, _)| {
                     let bounds = layout.bounds();
 
@@ -546,9 +328,11 @@ where
 
         self.elements
             .iter()
+            .zip(&tree.children)
             .zip(layout.children())
-            .map(|((_pane, content), layout)| {
+            .map(|(((_pane, content), tree), layout)| {
                 content.mouse_interaction(
+                    tree,
                     layout,
                     cursor_position,
                     viewport,
@@ -561,16 +345,17 @@ where
 
     fn draw(
         &self,
+        tree: &Tree,
         renderer: &mut Renderer,
         style: &renderer::Style,
         layout: Layout<'_>,
         cursor_position: Point,
         viewport: &Rectangle,
     ) {
-        let picked_pane = self.action.picked_pane();
+        let picked_pane = self.state.picked_pane();
 
         let picked_split = self
-            .action
+            .state
             .picked_split()
             .and_then(|(split, axis)| {
                 let bounds = layout.bounds();
@@ -625,7 +410,11 @@ where
             cursor_position
         };
 
-        for ((id, pane), layout) in self.elements.iter().zip(layout.children())
+        for (((id, pane), tree), layout) in self
+            .elements
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
         {
             match picked_pane {
                 Some((dragging, origin)) if *id == dragging => {
@@ -640,6 +429,7 @@ where
                         |renderer| {
                             renderer.with_layer(bounds, |renderer| {
                                 pane.draw(
+                                    tree,
                                     renderer,
                                     style,
                                     layout,
@@ -652,6 +442,7 @@ where
                 }
                 _ => {
                     pane.draw(
+                        tree,
                         renderer,
                         style,
                         layout,
@@ -702,15 +493,19 @@ where
         }
     }
 
-    fn overlay(
-        &mut self,
+    fn overlay<'b>(
+        &'b self,
+        tree: &'b mut Tree,
         layout: Layout<'_>,
         renderer: &Renderer,
     ) -> Option<overlay::Element<'_, Message, Renderer>> {
         self.elements
             .iter_mut()
+            .zip(&mut tree.children)
             .zip(layout.children())
-            .filter_map(|((_, pane), layout)| pane.overlay(layout, renderer))
+            .filter_map(|(((_, pane), tree), layout)| {
+                pane.overlay(tree, layout, renderer)
+            })
             .next()
     }
 }
@@ -718,7 +513,7 @@ where
 impl<'a, Message, Renderer> From<PaneGrid<'a, Message, Renderer>>
     for Element<'a, Message, Renderer>
 where
-    Renderer: 'a + crate::Renderer,
+    Renderer: 'a + iced_native::Renderer,
     Message: 'a,
 {
     fn from(

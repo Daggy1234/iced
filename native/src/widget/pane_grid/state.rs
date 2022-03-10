@@ -1,3 +1,4 @@
+//! The state of a [`PaneGrid`].
 use crate::widget::pane_grid::{
     Axis, Configuration, Direction, Node, Pane, Split,
 };
@@ -21,6 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 pub struct State<T> {
     pub(super) panes: HashMap<Pane, T>,
     pub(super) internal: Internal,
+    pub(super) action: Action,
 }
 
 impl<T> State<T> {
@@ -44,11 +46,8 @@ impl<T> State<T> {
 
         State {
             panes,
-            internal: Internal {
-                layout,
-                last_id,
-                action: Action::Idle,
-            },
+            internal: Internal { layout, last_id },
+            action: Action::Idle,
         }
     }
 
@@ -224,35 +223,54 @@ impl<T> State<T> {
     }
 }
 
+/// The internal state of a [`PaneGrid`].
 #[derive(Debug, Clone)]
 pub struct Internal {
     layout: Node,
     last_id: usize,
-    action: Action,
 }
 
+/// The current action of a [`PaneGrid`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Action {
+    /// The [`PaneGrid`] is idle.
     Idle,
-    Dragging { pane: Pane, origin: Point },
-    Resizing { split: Split, axis: Axis },
+    /// A [`Pane`] in the [`PaneGrid`] is being dragged.
+    Dragging {
+        /// The [`Pane`] being dragged.
+        pane: Pane,
+        /// The starting [`Point`] of the drag interaction.
+        origin: Point,
+    },
+    /// A [`Split`] in the [`PaneGrid`] is being dragged.
+    Resizing {
+        /// The [`Split`] being dragged.
+        split: Split,
+        /// The [`Axis`] of the [`Split`].
+        axis: Axis,
+    },
 }
 
-impl Internal {
+impl Action {
+    /// Returns the current [`Pane`] that is being dragged, if any.
     pub fn picked_pane(&self) -> Option<(Pane, Point)> {
-        match self.action {
+        match *self {
             Action::Dragging { pane, origin, .. } => Some((pane, origin)),
             _ => None,
         }
     }
 
+    /// Returns the current [`Split`] that is being dragged, if any.
     pub fn picked_split(&self) -> Option<(Split, Axis)> {
-        match self.action {
+        match *self {
             Action::Resizing { split, axis, .. } => Some((split, axis)),
             _ => None,
         }
     }
+}
 
+impl Internal {
+    /// Calculates the current [`Pane`] regions from the [`PaneGrid`] layout.
     pub fn pane_regions(
         &self,
         spacing: f32,
@@ -261,35 +279,12 @@ impl Internal {
         self.layout.pane_regions(spacing, size)
     }
 
+    /// Calculates the current [`Split`] regions from the [`PaneGrid`] layout.
     pub fn split_regions(
         &self,
         spacing: f32,
         size: Size,
     ) -> BTreeMap<Split, (Axis, Rectangle, f32)> {
         self.layout.split_regions(spacing, size)
-    }
-
-    pub fn pick_pane(&mut self, pane: &Pane, origin: Point) {
-        self.action = Action::Dragging {
-            pane: *pane,
-            origin,
-        };
-    }
-
-    pub fn pick_split(&mut self, split: &Split, axis: Axis) {
-        // TODO: Obtain `axis` from layout itself. Maybe we should implement
-        // `Node::find_split`
-        if self.picked_pane().is_some() {
-            return;
-        }
-
-        self.action = Action::Resizing {
-            split: *split,
-            axis,
-        };
-    }
-
-    pub fn idle(&mut self) {
-        self.action = Action::Idle;
     }
 }
